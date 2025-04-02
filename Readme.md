@@ -1,0 +1,2 @@
+### Learning CUDA
+This repository is aimed to document my CUDA and triton learning process. We will start with the process from the simplest of problems and then add complexity along the way. Where possible I will aim to demostrate the performance comparison between traditional methods such as in python, pytorch etc
