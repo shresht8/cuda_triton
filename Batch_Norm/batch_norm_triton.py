@@ -64,7 +64,7 @@ def _batch_norm_fwd_fused(
         tl.store(Y + rows * stride, y, mask=mask)
 
 @triton.jit
-def _layer_norm_bwd_dx_fused(DX,  # pointer to the input gradient
+def _batch_norm_bwd_dx_fused(DX,  # pointer to the input gradient
                              DY,  # pointer to the output gradient
                              DW,  # pointer to the partial sum of weights gradient
                              DB,  # pointer to the partial sum of biases gradient
@@ -127,13 +127,31 @@ def _layer_norm_bwd_dx_fused(DX,  # pointer to the input gradient
     tl.atomic_xchg(Lock, 0)
 
 @triton.jit
-def _layer_norm_bwd_dwdb(DW,  # pointer to the partial sum of weights gradient
+def _batch_norm_bwd_dwdb(DW,  # pointer to the partial sum of weights gradient
                          DB,  # pointer to the partial sum of biases gradient
                          FINAL_DW,  # pointer to the weights gradient
                          FINAL_DB,  # pointer to the biases gradient
-                         M,  # GROUP_SIZE_M
-                         N,  # number of columns
+                         stride, # Number of columns
+                         N,  # GROUP_SIZE_N
+                         M,  # number of rows
                          BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
+    pid = tl.program_id(0)
+    rows = pid*BLOCK_SIZE_M + tl.arange(0,BLOCK_SIZE_M)
+    dw = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    db = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    # Iterate through the rows of DW and DB to sum the partial sums.
+    for i in range(0, N, BLOCK_SIZE_N):
+        cols = i + tl.arange(0, BLOCK_SIZE_N)
+        mask = (rows[:, None] < M) & (cols[None, :] < N)
+        offs = rows[:, None] * stride + cols[None, :]
+        dw += tl.load(DW + offs, mask=mask, other=0.)
+        db += tl.load(DB + offs, mask=mask, other=0.)
+    # Write the final sum to the output.
+    sum_dw = tl.sum(dw, axis=0)
+    sum_db = tl.sum(db, axis=0)
+    tl.store(FINAL_DW + rows*stride, sum_dw, mask=rows < M)
+    tl.store(FINAL_DB + rows*stride, sum_db, mask=rows < M)
+
 
 
 
