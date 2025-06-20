@@ -13,6 +13,7 @@ except ModuleNotFoundError:
 
 DEVICE = torch.device("cuda:0")
 
+@triton.jit
 def _batch_norm_fwd_fused(
     X,  # pointer to the input
     Y,  # pointer to the output
@@ -72,10 +73,9 @@ def _batch_norm_bwd_dx_fused(DX,  # pointer to the input gradient
                              W,  # pointer to the weights
                              Mean,  # pointer to the mean
                              Rstd,  # pointer to the 1/std
-                             Lock,  # pointer to the lock
                              stride,  # how much to increase the pointer when moving by 1 row
                              M,  # number of rows in X
-                             GROUP_SIZE_N: tl.constexpr, BLOCK_SIZE_M: tl.constexpr):
+                             BLOCK_SIZE_M: tl.constexpr):
     # Map the program id to the elements of X, DX, and DY it should compute.
     col = tl.program_id(0)
     rows = tl.arange(0, BLOCK_SIZE_M)
@@ -83,12 +83,8 @@ def _batch_norm_bwd_dx_fused(DX,  # pointer to the input gradient
     X += col
     DY += col
     DX += col
-    # Offset locks and weights/biases gradient pointer for parallel reduction
-    lock_id = col % GROUP_SIZE_N
-    Lock += lock_id
-    Count = Lock + GROUP_SIZE_N
-    DW = DW + lock_id * M + rows*stride
-    DB = DB + lock_id * M + rows*stride
+    DW = DW + col
+    DB = DB + col
     # Load data to SRAM
     x = tl.load(X + rows*stride, mask=mask, other=0).to(tl.float32)
     dy = tl.load(DY + rows*stride, mask=mask, other=0).to(tl.float32)
@@ -104,56 +100,90 @@ def _batch_norm_bwd_dx_fused(DX,  # pointer to the input gradient
     dx=w_var*(c1-c2-c3)
     # Write dx
     tl.store(DX+rows*stride,dx,mask=mask)
-    # Accumulate partial sums for dw/db
-    partial_dw = (dy*xhat).to(w.dtype)
-    partial_db = dy.to(w.dtype)
-    while tl.atomic_cas(Lock, 0, 1) == 1:
-        pass
-    count = tl.load(Count)
-    # First store doesn't accumulate
-    if count == 0:
-        tl.atomic_xchg(Count, 1)
-    else:
-        partial_dw += tl.load(DW, mask=mask)
-        partial_db += tl.load(DB, mask=mask)
-    tl.store(DW, partial_dw, mask=mask)
-    tl.store(DB, partial_db, mask=mask)
+    dw = tl.sum(dy*xhat,axis=0)
+    db = tl.sum(dy,axis=0)
+    tl.store(DW, dw)
+    tl.store(DB, db)
 
-    # need a barrier to ensure all threads finished before
-    # releasing the lock
-    tl.debug_barrier()
+class BatchNorm(torch.autograd.Function):
 
-    # Release the lock
-    tl.atomic_xchg(Lock, 0)
+    @staticmethod
+    def forward(ctx, x, weight, bias, eps):
+        # allocate output
+        y = torch.empty_like(x)
+        # reshape input data into 2D tensor
+        x_arg = x.reshape(-1, x.shape[-1])
+        M, N = x_arg.shape
+        mean = torch.empty((N, ), dtype=torch.float32, device=x.device)
+        rstd = torch.empty((N, ), dtype=torch.float32, device=x.device)
+        # Less than 64KB per feature: enqueue fused kernel
+        MAX_FUSED_SIZE = 65536 // x.element_size()
+        BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(M))
+        if M > BLOCK_SIZE:
+            raise RuntimeError("This layer norm doesn't support batch dim >= 64KB.")
+        # heuristics for number of warps
+        num_warps = min(max(BLOCK_SIZE // 256, 1), 8)
+        # enqueue kernel
+        _batch_norm_fwd_fused[(N, )](  #
+            x_arg, y, weight, bias, mean, rstd,  #
+            x_arg.stride(0), M, eps,  #
+            BLOCK_SIZE=BLOCK_SIZE, num_warps=num_warps, num_ctas=1)
+        ctx.save_for_backward(x, weight, bias, mean, rstd)
+        ctx.BLOCK_SIZE = BLOCK_SIZE
+        ctx.num_warps = num_warps
+        ctx.eps = eps
+        return y
 
-@triton.jit
-def _batch_norm_bwd_dwdb(DW,  # pointer to the partial sum of weights gradient
-                         DB,  # pointer to the partial sum of biases gradient
-                         FINAL_DW,  # pointer to the weights gradient
-                         FINAL_DB,  # pointer to the biases gradient
-                         stride, # Number of columns
-                         N,  # GROUP_SIZE_N
-                         M,  # number of rows
-                         BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
-    pid = tl.program_id(0)
-    rows = pid*BLOCK_SIZE_M + tl.arange(0,BLOCK_SIZE_M)
-    dw = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    db = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    # Iterate through the rows of DW and DB to sum the partial sums.
-    for i in range(0, N, BLOCK_SIZE_N):
-        cols = i + tl.arange(0, BLOCK_SIZE_N)
-        mask = (rows[:, None] < M) & (cols[None, :] < N)
-        offs = rows[:, None] * stride + cols[None, :]
-        dw += tl.load(DW + offs, mask=mask, other=0.)
-        db += tl.load(DB + offs, mask=mask, other=0.)
-    # Write the final sum to the output.
-    sum_dw = tl.sum(dw, axis=0)
-    sum_db = tl.sum(db, axis=0)
-    tl.store(FINAL_DW + rows*stride, sum_dw, mask=rows < M)
-    tl.store(FINAL_DB + rows*stride, sum_db, mask=rows < M)
+    @staticmethod
+    def backward(ctx, dy):
+        x, w, b, m, v = ctx.saved_tensors
+        # heuristics for amount of parallel reduction stream for DW/DB
+        N = w.shape[0]
+        # allocate output
+        dw = torch.empty((N, ), dtype=w.dtype, device=w.device)
+        db = torch.empty((N, ), dtype=w.dtype, device=w.device)
+        dx = torch.empty_like(dy)
+        # enqueue kernel using forward pass heuristics
+        # also compute partial sums for DW and DB
+        x_arg = x.reshape(-1, x.shape[-1])
+        M, N = x_arg.shape
+        _batch_norm_bwd_dx_fused[(N, )](  #
+            dx, dy, dw, db, x, w, m, v,  #
+            x_arg.stride(0), M,  #
+            BLOCK_SIZE_M=ctx.BLOCK_SIZE,  #
+            num_warps=ctx.num_warps)
+        return dx, None, dw, db, None
 
 
+batch_norm = BatchNorm.apply
 
+def test_batch_norm(M, N, dtype, eps=1e-5, device=DEVICE):
+    # create data
+    x_shape = (M, N)
+    w_shape = (x_shape[-1], )
+    weight = torch.rand(w_shape, dtype=dtype, device=device, requires_grad=True)
+    bias = torch.rand(w_shape, dtype=dtype, device=device, requires_grad=True)
+    x = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device=device)
+    dy = .1 * torch.randn_like(x)
+    x.requires_grad_(True)
+    # forward pass
+    y_tri = batch_norm(x, weight, bias, eps)
+    y_ref = torch.nn.functional.batch_norm(
+        x, running_mean=None, running_var=None,
+        weight=weight, bias=bias, training=True, eps=eps
+    )
+    # backward pass (triton)
+    y_tri.backward(dy, retain_graph=True)
+    dx_tri, dw_tri, db_tri = [_.grad.clone() for _ in [x, weight, bias]]
+    x.grad, weight.grad, bias.grad = None, None, None
+    # backward pass (torch)
+    y_ref.backward(dy, retain_graph=True)
+    dx_ref, dw_ref, db_ref = [_.grad.clone() for _ in [x, weight, bias]]
+    # compare
+    assert torch.allclose(y_tri, y_ref, atol=1e-2, rtol=0)
+    assert torch.allclose(dx_tri, dx_ref, atol=1e-2, rtol=0)
+    assert torch.allclose(db_tri, db_ref, atol=1e-2, rtol=0)
+    assert torch.allclose(dw_tri, dw_ref, atol=1e-2, rtol=0)
 
-
-
+if __name__ == '__main__':
+    test_batch_norm(1151,8192,torch.float16)
