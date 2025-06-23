@@ -118,9 +118,12 @@ class BatchNorm(torch.autograd.Function):
         rstd = torch.empty((N, ), dtype=torch.float32, device=x.device)
         # Less than 64KB per feature: enqueue fused kernel
         MAX_FUSED_SIZE = 65536 // x.element_size()
-        BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(M))
-        if M > BLOCK_SIZE:
-            raise RuntimeError("This layer norm doesn't support batch dim >= 64KB.")
+        # BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(M))
+        # if M > BLOCK_SIZE:
+        #     raise RuntimeError("This layer norm doesn't support batch dim >= 64KB.")
+        BLOCK_SIZE = triton.next_power_of_2(M)
+        if BLOCK_SIZE > MAX_FUSED_SIZE:
+            raise RuntimeError("Batch size too large - exceeds 64KB limit.")
         # heuristics for number of warps
         num_warps = min(max(BLOCK_SIZE // 256, 1), 8)
         # enqueue kernel
@@ -152,28 +155,41 @@ class BatchNorm(torch.autograd.Function):
             x_arg.stride(0), M,  #
             BLOCK_SIZE_M=ctx.BLOCK_SIZE,  #
             num_warps=ctx.num_warps)
-        return dx, None, dw, db, None
+        return dx, dw, db, None
 
 
 batch_norm = BatchNorm.apply
 
+
 def test_batch_norm(M, N, dtype, eps=1e-5, device=DEVICE):
+    print(f"Starting test with M={M}, N={N}, dtype={dtype}")
+
     # create data
+    print("Creating test data...")
     x_shape = (M, N)
-    w_shape = (x_shape[-1], )
+    w_shape = (x_shape[-1],)
     weight = torch.rand(w_shape, dtype=dtype, device=device, requires_grad=True)
     bias = torch.rand(w_shape, dtype=dtype, device=device, requires_grad=True)
     x = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device=device)
     dy = .1 * torch.randn_like(x)
     x.requires_grad_(True)
+
     # forward pass
+    print("Running Triton forward pass...")
     y_tri = batch_norm(x, weight, bias, eps)
+    print("Triton forward pass completed!")
+
+    print("Running PyTorch forward pass...")
     y_ref = torch.nn.functional.batch_norm(
         x, running_mean=None, running_var=None,
         weight=weight, bias=bias, training=True, eps=eps
     )
+    print("PyTorch forward pass completed!")
+
     # backward pass (triton)
+    print("Running Triton backward pass...")
     y_tri.backward(dy, retain_graph=True)
+    print("Triton backward pass completed!")
     dx_tri, dw_tri, db_tri = [_.grad.clone() for _ in [x, weight, bias]]
     x.grad, weight.grad, bias.grad = None, None, None
     # backward pass (torch)
@@ -185,5 +201,18 @@ def test_batch_norm(M, N, dtype, eps=1e-5, device=DEVICE):
     assert torch.allclose(db_tri, db_ref, atol=1e-2, rtol=0)
     assert torch.allclose(dw_tri, dw_ref, atol=1e-2, rtol=0)
 
+
 if __name__ == '__main__':
-    test_batch_norm(1151,8192,torch.float16)
+    try:
+        print("Testing with small dimensions first...")
+        test_batch_norm(32, 64, torch.float32)  # Smaller, easier to debug
+        print("Small test passed!")
+
+        print("Testing with original dimensions...")
+        test_batch_norm(1151, 8192, torch.float16)
+        print("✅ All tests passed!")
+    except Exception as e:
+        print(f"❌ Test failed: {e}")
+        import traceback
+
+        traceback.print_exc()
